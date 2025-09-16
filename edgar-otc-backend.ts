@@ -1,144 +1,194 @@
+Here’s a single drop-in replacement for **`edgar-otc-backend.ts`**. Copy **all** of this, replace your file’s contents, commit, and Render will rebuild.
+
+```ts
 // edgar-otc-backend.ts — Daily refreshed search API (SEC EDGAR + OTC stub)
-// ---------------------------------------------------------------
+// ----------------------------------------------------------------------
 // WHAT THIS DOES
 // - Refreshes a daily snapshot every morning (6:30 AM America/New_York)
-// - Pulls key fundamentals from SEC EDGAR (Revenue, CFO, Debt, Accounts Payable)
-// - Estimates last fundraising date from recent submissions (424B*, S-1/S-3, 8-K, Form D)
+// - Pulls key fundamentals from SEC EDGAR companyfacts (Revenue, CFO, Debt, AP)
+// - Estimates last fundraising date from submissions (424B*, S-1/S-3, 8-K, Form D)
+// - Tries to infer company location from submissions (state/country)
 // - Serves /api/search so your web UI can filter companies by your criteria
 //
 // QUICK START (local dev)
-// 1) Ensure Node.js 18+ is installed (https://nodejs.org)
-// 2) In an empty folder, run:
-//      npm init -y
-//      npm i express cors node-cron zod
-//      npm i -D typescript ts-node @types/express @types/node
-//      npx tsc --init
-// 3) Create this file as edgar-otc-backend.ts and paste this entire content.
-// 4) Run it:
-//      export TZ=America/New_York
-//      export PORT=4000
-//      export SEC_UA="yourname@yourfirm.com"   // SEC asks for a descriptive User-Agent
-//      npx ts-node edgar-otc-backend.ts
-// 5) Test in a browser:
-//      http://localhost:4000/api/search?exchanges=NYSE,NASDAQ,OTC&revenue_min=100000000
+//   node >= 18 is required (global fetch)
+//   npm i express cors node-cron zod
+//   npm i -D typescript ts-node @types/express @types/node @types/cors @types/node-cron
+//   npx tsc --init
+//   SEC_UA=<you@yourfirm.com> TZ=America/New_York PORT=4000 npx ts-node edgar-otc-backend.ts
 //
-// DEPLOY (Render)
-// - Build command:  npm install && npm run build
-// - Start command:  npm run start
-// - Add env vars:   TZ=America/New_York  SEC_UA=yourname@yourfirm.com
-// - See the step-by-step guide I’ll send after this file.
-// ---------------------------------------------------------------
+// RENDER SETTINGS
+//   Build:  npm install && npm run build
+//   Start:  npm run start
+//   Env:    TZ=America/New_York   SEC_UA=you@yourfirm.com   UNIVERSE_LIMIT=300
+// ----------------------------------------------------------------------
 
-import express from 'express';
-import cors from 'cors';
-import cron from 'node-cron';
-import { z } from 'zod';
-
-// Node 18+ has global fetch; if not available, install node-fetch and import it.
+import express from "express";
+import cors from "cors";
+import cron from "node-cron";
+import { z } from "zod";
 
 const PORT = process.env.PORT || 4000;
-const TIMEZONE = 'America/New_York';
-const SEC_UA = process.env.SEC_UA || 'contact@yourfirm.com';
+const TIMEZONE = "America/New_York";
+const SEC_UA = process.env.SEC_UA || "contact@yourfirm.com";
+const UNIVERSE_LIMIT = Number(process.env.UNIVERSE_LIMIT || 300); // how many tickers to scan daily
 
 // ---------------- Types ----------------
 
-type Exchange = 'NYSE' | 'NASDAQ' | 'OTC' | 'PRIVATE';
+type Exchange = "NYSE" | "NASDAQ" | "OTC" | "PRIVATE";
 
 type Company = {
   ticker?: string;
-  cik?: string;               // 10-digit zero-padded
+  cik?: string; // 10-digit zero-padded
   name: string;
   exchange: Exchange;
-  location?: string;          // optional: state or country code
+  location?: string; // state or country (best effort)
   revenueLTMUSD?: number;
-  cfoLTMUSD?: number;         // cash flow from operations (LTM)
-  totalDebtUSD?: number;      // long-term + short-term
+  cfoLTMUSD?: number; // cash flow from ops (LTM-ish, most recent USD value)
+  totalDebtUSD?: number; // LT debt + ST debt
   accountsPayableUSD?: number;
-  advUSD?: number;            // avg daily dollar volume (approx) — OTC stubbed
+  advUSD?: number; // avg daily $ volume (OTC stub for now)
   marketCapUSD?: number;
-  lastFundraisingDate?: string; // YYYY-MM-DD if detected
+  lastFundraisingDate?: string; // YYYY-MM-DD (best effort)
 };
 
 type Snapshot = { date: string; items: Company[] };
-let SNAPSHOT: Snapshot = { date: '', items: [] };
 
-// ------------- Helpers -------------
+let SNAPSHOT: Snapshot = { date: "", items: [] };
+let UNIVERSE: { ticker: string; cik?: string; exchange: Exchange; name?: string }[] = [];
+
+// ---------------- Helpers ----------------
 
 function todayET(): string {
-  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
   const p = fmt.formatToParts(new Date());
-  const y = p.find(x=>x.type==='year')!.value, m = p.find(x=>x.type==='month')!.value, d = p.find(x=>x.type==='day')!.value;
+  const y = p.find((x) => x.type === "year")!.value;
+  const m = p.find((x) => x.type === "month")!.value;
+  const d = p.find((x) => x.type === "day")!.value;
   return `${y}-${m}-${d}`;
 }
 
-function padCIK(raw: string) { return raw.padStart(10, '0'); }
+function padCIK(raw: string) {
+  return raw.padStart(10, "0");
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 async function secJSON(url: string) {
-  const res = await fetch(url, { headers: { 'User-Agent': SEC_UA, 'Accept': 'application/json' } as any });
+  const res = await fetch(url, {
+    headers: { "User-Agent": SEC_UA, Accept: "application/json" } as any,
+  });
   if (!res.ok) throw new Error(`SEC fetch ${res.status} ${url}`);
   return res.json();
 }
 
-// \!\! IMPORTANT: This is a tiny demo universe. Replace with a broader ticker list when ready.
-// You can also persist to a DB. For now this keeps things simple and fast.
-const UNIVERSE: {ticker: string; cik?: string; exchange: Exchange; name?: string; location?: string}[] = [
-  { ticker: 'VCTR', exchange: 'NASDAQ' },
-  { ticker: 'HBRF', exchange: 'NYSE' },
-  { ticker: 'EDEN', exchange: 'OTC' },
-  { ticker: 'QMIN', exchange: 'OTC' },
-];
+function classifyExchange(ticker: string): Exchange {
+  const t = ticker.toUpperCase();
+  // Heuristics: 5-char tickers or those with '.' or ending 'F' → often OTC
+  if (t.length === 5 || t.includes(".") || t.endsWith("F")) return "OTC";
+  return "NASDAQ"; // we don't get exchange in SEC mapping; treat as NASDAQ by default
+}
 
-// Map ticker -> CIK (SEC publishes a mapping JSON). We keep it simple for now.
-async function tickerToCIK(ticker: string): Promise<{cik?: string; name?: string}>
-{ try {
-    const data = await secJSON('https://www.sec.gov/files/company_tickers.json');
-    for (const k of Object.keys(data)) {
-      const row = data[k];
-      if (row.ticker?.toUpperCase() === ticker.toUpperCase()) {
-        return { cik: padCIK(String(row.cik)), name: row.title };
-      }
-    }
-    return {};
-  } catch { return {}; } }
+// Build a larger ticker universe from SEC's mapping file
+async function buildUniverse(): Promise<
+  { ticker: string; cik?: string; exchange: Exchange; name?: string }[]
+> {
+  const data = await secJSON("https://www.sec.gov/files/company_tickers.json");
+  const rows = Object.keys(data).map((k) => data[k]) as Array<{
+    cik: number;
+    ticker: string;
+    title: string;
+  }>;
+
+  // Take the first N (keep light for free tier)
+  return rows.slice(0, UNIVERSE_LIMIT).map((r) => ({
+    ticker: r.ticker.toUpperCase(),
+    cik: padCIK(String(r.cik)),
+    exchange: classifyExchange(r.ticker),
+    name: r.title,
+  }));
+}
 
 // Pull XBRL company facts for a CIK; extract core metrics
 async function pullFacts(cik: string): Promise<Partial<Company>> {
   try {
-    const facts = await secJSON(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`);
-    const usgaap = facts.facts?.['us-gaap'] || {};
+    const facts = await secJSON(
+      `https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`
+    );
+    const usgaap = facts.facts?.["us-gaap"] || {};
     const pickUSD = (tag: string) => {
-      const arr = usgaap[tag]?.units?.USD as any[] | undefined;
-      if (!arr || !arr.length) return undefined;
-      const sorted = [...arr].sort((a,b) => (b.end||'').localeCompare(a.end||''));
-      return Number(sorted[0]?.val);
+      const arr = (usgaap[tag]?.units?.USD as any[]) || [];
+      if (!arr.length) return undefined;
+      // most recent by end date
+      const sorted = [...arr].sort((a, b) =>
+        String(b.end || "").localeCompare(String(a.end || ""))
+      );
+      const val = Number(sorted[0]?.val);
+      return Number.isFinite(val) ? val : undefined;
     };
-    const revenue = pickUSD('Revenues') ?? pickUSD('SalesRevenueNet');
-    const cfo = pickUSD('NetCashProvidedByUsedInOperatingActivities');
-    const ltd = pickUSD('LongTermDebtNoncurrent') ?? pickUSD('LongTermDebt');
-    const std = pickUSD('ShortTermBorrowings') ?? pickUSD('DebtCurrent');
-    const ap = pickUSD('AccountsPayableCurrent');
-    return { revenueLTMUSD: revenue, cfoLTMUSD: cfo, totalDebtUSD: (ltd ?? 0) + (std ?? 0), accountsPayableUSD: ap };
-  } catch (e) { return {}; }
+
+    const revenue =
+      pickUSD("Revenues") ??
+      pickUSD("SalesRevenueNet") ??
+      pickUSD("RevenueFromContractWithCustomerExcludingAssessedTax");
+    const cfo = pickUSD("NetCashProvidedByUsedInOperatingActivities");
+    const ltd =
+      pickUSD("LongTermDebtNoncurrent") ?? pickUSD("LongTermDebt") ?? 0;
+    const std =
+      pickUSD("ShortTermBorrowings") ?? pickUSD("DebtCurrent") ?? 0;
+    const ap = pickUSD("AccountsPayableCurrent");
+
+    return {
+      revenueLTMUSD: revenue,
+      cfoLTMUSD: cfo,
+      totalDebtUSD: (ltd || 0) + (std || 0),
+      accountsPayableUSD: ap,
+    };
+  } catch {
+    return {};
+  }
 }
 
-// Estimate last fundraising date from recent submissions
-// Signals: 424B*, 8-K, S-1, S-3, Form D (best-effort)
-async function estimateLastFundraisingDate(cik?: string): Promise<string | undefined> {
-  if (!cik) return undefined;
+// Fetch submissions once; derive both location and last fundraising date
+async function fetchSubmissions(cik: string): Promise<any | undefined> {
   try {
-    const subs = await secJSON(`https://data.sec.gov/submissions/CIK${cik}.json`);
-    const forms: string[] = subs.filings?.recent?.form || [];
-    const dates: string[] = subs.filings?.recent?.filingDate || [];
-    let best: string | undefined;
-    for (let i = 0; i < forms.length; i++) {
-      const f = String(forms[i]).toUpperCase();
-      if (/^(424B\d|8-K|S-1|S-3|D)$/.test(f)) {
-        const dt = dates[i];
-        if (!best || dt > best) best = dt;
-      }
+    return await secJSON(`https://data.sec.gov/submissions/CIK${cik}.json`);
+  } catch {
+    return undefined;
+  }
+}
+
+function estimateLocationFromSubs(subs: any): string | undefined {
+  if (!subs) return undefined;
+  const loc =
+    subs?.stateOfIncorporation ||
+    subs?.addresses?.business?.stateOrCountry ||
+    subs?.addresses?.mailing?.stateOrCountry ||
+    subs?.stateOfIncorporationDescription;
+  return typeof loc === "string" ? loc : undefined;
+}
+
+function estimateLastFundraisingDateFromSubs(subs: any): string | undefined {
+  if (!subs) return undefined;
+  const forms: string[] = subs.filings?.recent?.form || [];
+  const dates: string[] = subs.filings?.recent?.filingDate || [];
+  let best: string | undefined;
+  for (let i = 0; i < forms.length; i++) {
+    const f = String(forms[i]).toUpperCase();
+    // Common fundraising-related forms
+    if (/^(424B\d|8-K|S-1|S-3|D)$/.test(f)) {
+      const dt = dates[i];
+      if (!best || dt > best) best = dt;
     }
-    return best; // YYYY-MM-DD
-  } catch { return undefined; }
+  }
+  return best; // YYYY-MM-DD
 }
 
 // OTC markets daily dollar volume (stub). Replace with your OTCMarkets provider later.
@@ -146,40 +196,78 @@ async function pullOTCVolumeUSD(_ticker: string): Promise<number | undefined> {
   return undefined;
 }
 
-// Build the daily snapshot (lightweight demo)
+// ---------------- Snapshot refresh ----------------
+
 async function refreshSnapshot(): Promise<Snapshot> {
   const date = todayET();
+
+  if (UNIVERSE.length === 0) {
+    try {
+      UNIVERSE = await buildUniverse();
+      console.log(`[universe] loaded ${UNIVERSE.length} tickers`);
+    } catch (e) {
+      console.error("universe load failed", e);
+      // fallback tiny universe if SEC mapping fails
+      UNIVERSE = [
+        { ticker: "VCTR", exchange: "NASDAQ" },
+        { ticker: "HBRF", exchange: "NYSE" },
+        { ticker: "EDEN", exchange: "OTC" },
+        { ticker: "QMIN", exchange: "OTC" },
+      ];
+    }
+  }
+
   const out: Company[] = [];
+
   for (const u of UNIVERSE) {
-    let cik = u.cik; let name = u.name;
-    if (!cik) { const m = await tickerToCIK(u.ticker); cik = m.cik; name = name || m.name; }
-    const facts = cik ? await pullFacts(cik) : {};
-    const advUSD = u.exchange === 'OTC' ? await pullOTCVolumeUSD(u.ticker) : undefined;
-    const lastFundraisingDate = await estimateLastFundraisingDate(cik);
+    const cik = u.cik;
+    const name = u.name || u.ticker;
+    let facts: Partial<Company> = {};
+    let subs: any | undefined;
+
+    if (cik) {
+      // Be polite to SEC - tiny delay between requests
+      await sleep(120);
+      facts = await pullFacts(cik);
+      await sleep(80);
+      subs = await fetchSubmissions(cik);
+    }
+
+    const advUSD =
+      u.exchange === "OTC" ? await pullOTCVolumeUSD(u.ticker) : undefined;
+
     out.push({
       ticker: u.ticker,
       cik,
-      name: name || u.ticker,
+      name,
       exchange: u.exchange,
-      location: u.location,
+      location: estimateLocationFromSubs(subs),
+      lastFundraisingDate: estimateLastFundraisingDateFromSubs(subs),
       advUSD,
-      lastFundraisingDate,
       ...facts,
     });
   }
+
   SNAPSHOT = { date, items: out };
   console.log(`[snapshot ${date}] companies=${out.length}`);
   return SNAPSHOT;
 }
 
-// Initial & daily 6:30am ET refresh
+// initial & scheduled daily refresh
 refreshSnapshot().catch(console.error);
-cron.schedule('30 6 * * *', () => { refreshSnapshot().catch(console.error); }, { timezone: TIMEZONE });
+cron.schedule(
+  "30 6 * * *",
+  () => {
+    refreshSnapshot().catch(console.error);
+  },
+  { timezone: TIMEZONE }
+);
 
-// ---------------- API ----------------
+// ---------------- Express API ----------------
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const Q = z.object({
   revenue_min: z.coerce.number().optional(),
@@ -192,33 +280,66 @@ const Q = z.object({
   exchanges: z.string().optional(), // comma list e.g. "NYSE,NASDAQ,OTC"
 });
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, date: SNAPSHOT.date }));
+app.get("/", (_req, res) => {
+  res
+    .type("text/html")
+    .send(`
+    <h2>EDGAR+OTC Deal Screener API</h2>
+    <p>Daily snapshot (6:30am ET). Try:</p>
+    <ul>
+      <li><a href="/api/health">/api/health</a></li>
+      <li><a href="/api/search?exchanges=NYSE,NASDAQ,OTC">/api/search?exchanges=NYSE,NASDAQ,OTC</a></li>
+      <li><a href="/api/search?exchanges=NASDAQ,OTC&revenue_min=10000000">/api/search with filters</a></li>
+    </ul>`);
+});
 
-app.post('/api/refresh', async (_req, res) => {
+app.get("/api/health", (_req, res) => res.json({ ok: true, date: SNAPSHOT.date }));
+
+app.post("/api/refresh", async (_req, res) => {
   const snap = await refreshSnapshot();
   res.json({ ok: true, date: snap.date, count: snap.items.length });
 });
 
-app.get('/api/search', async (req, res) => {
-  try {
-    const q = Q.parse(req.query);
-    if (SNAPSHOT.date !== todayET()) await refreshSnapshot();
-    const exAllowed = q.exchanges ? q.exchanges.split(',').map(s=>s.trim().toUpperCase()) as Exchange[] : undefined;
-    const filtered = SNAPSHOT.items.filter(c => {
-      if (exAllowed && !exAllowed.includes(c.exchange)) return false;
-      if (q.location && (c.location||'').toLowerCase() !== q.location.toLowerCase()) return false;
-      if (q.revenue_min != null && (c.revenueLTMUSD ?? -Infinity) < q.revenue_min) return false;
-      if (q.revenue_max != null && (c.revenueLTMUSD ?? Infinity) > q.revenue_max) return false;
-      if (q.cfo_min != null && (c.cfoLTMUSD ?? -Infinity) < q.cfo_min) return false;
-      if (q.debt_max != null && (c.totalDebtUSD ?? Infinity) > q.debt_max) return false;
-      if (q.ap_max != null && (c.accountsPayableUSD ?? Infinity) > q.ap_max) return false;
-      if (q.adv_min != null && (c.advUSD ?? 0) < q.adv_min) return false;
-      return true;
-    });
-    res.json({ date: SNAPSHOT.date, count: filtered.length, items: filtered });
-  } catch (e:any) {
-    res.status(400).json({ error: e?.message || 'bad query' });
+function ensureFresh() {
+  return async (_req: any, _res: any, next: any) => {
+    try {
+      if (SNAPSHOT.date !== todayET()) {
+        await refreshSnapshot();
+      }
+    } catch (e) {
+      console.error("ensureFresh error", e);
+    } finally {
+      next();
+    }
+  };
+}
+
+app.get("/api/search", ensureFresh(), (req, res) => {
+  const q = Q.safeParse(req.query);
+  if (!q.success) {
+    return res.status(400).json({ error: "bad query", details: q.error.flatten() });
   }
+  const p = q.data;
+  const exAllowed = p.exchanges
+    ? (p.exchanges.split(",").map((s) => s.trim().toUpperCase()) as Exchange[])
+    : undefined;
+
+  const filtered = SNAPSHOT.items.filter((c) => {
+    if (exAllowed && !exAllowed.includes(c.exchange)) return false;
+    if (p.location && (c.location || "").toLowerCase() !== p.location.toLowerCase()) return false;
+    if (p.revenue_min != null && (c.revenueLTMUSD ?? -Infinity) < p.revenue_min) return false;
+    if (p.revenue_max != null && (c.revenueLTMUSD ?? Infinity) > p.revenue_max) return false;
+    if (p.cfo_min != null && (c.cfoLTMUSD ?? -Infinity) < p.cfo_min) return false;
+    if (p.debt_max != null && (c.totalDebtUSD ?? Infinity) > p.debt_max) return false;
+    if (p.ap_max != null && (c.accountsPayableUSD ?? Infinity) > p.ap_max) return false;
+    if (p.adv_min != null && (c.advUSD ?? 0) < p.adv_min) return false;
+    return true;
+  });
+
+  res.json({ date: SNAPSHOT.date, count: filtered.length, items: filtered });
 });
 
-app.listen(PORT, () => console.log(`EDGAR+OTC backend on :${PORT}, daily 6:30am ET refresh`));
+app.listen(PORT, () =>
+  console.log(`EDGAR+OTC backend on :${PORT}, daily 6:30am ET refresh`)
+);
+```
