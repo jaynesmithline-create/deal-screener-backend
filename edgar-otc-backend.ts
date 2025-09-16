@@ -1,18 +1,5 @@
-// edgar-otc-backend.ts — Daily refreshed search API (SEC EDGAR + OTC stub)
+// edgar-otc-backend.ts — Loan-fit screener (SEC EDGAR)
 // ----------------------------------------------------------------------
-// WHAT THIS DOES
-// - Refreshes a daily snapshot every morning (6:30 AM America/New_York)
-// - Pulls key fundamentals from SEC EDGAR companyfacts (Revenue, CFO, Debt, AP)
-// - Estimates last fundraising date from submissions (424B*, S-1/S-3, 8-K, Form D)
-// - Tries to infer company location from submissions (state/country)
-// - Serves /api/search so your web UI can filter companies by your criteria
-//
-// RENDER ENV
-//   TZ=America/New_York
-//   SEC_UA=you@yourfirm.com
-//   UNIVERSE_LIMIT=300
-// ----------------------------------------------------------------------
-
 import express from "express";
 import cors from "cors";
 import cron from "node-cron";
@@ -23,77 +10,68 @@ const TIMEZONE = "America/New_York";
 const SEC_UA = process.env.SEC_UA || "contact@yourfirm.com";
 const UNIVERSE_LIMIT = Number(process.env.UNIVERSE_LIMIT || 300);
 
+// ---------- Types ----------
 type Exchange = "NYSE" | "NASDAQ" | "OTC" | "PRIVATE";
-
 type Company = {
   ticker?: string;
   cik?: string;
   name: string;
   exchange: Exchange;
   location?: string;
+
+  // Core metrics
   revenueLTMUSD?: number;
   cfoLTMUSD?: number;
   totalDebtUSD?: number;
   accountsPayableUSD?: number;
-  advUSD?: number;
-  marketCapUSD?: number;
-  lastFundraisingDate?: string; // YYYY-MM-DD
+
+  // Asset components (for borrowing base)
+  arUSD?: number;         // Accounts Receivable, net
+  inventoryUSD?: number;  // Inventory, net
+  ppeUSD?: number;        // Property, Plant & Equipment, net
+
+  // Derived loan-fit metrics
+  borrowingBaseUSD?: number;
+  paybackYearsAtLoan?: number; // loan_size / CFO
+  loanCoverage?: number;       // borrowingBaseUSD / loan_size
+
+  // Other
+  advUSD?: number;             // (stub for now)
+  lastFundraisingDate?: string;
 };
 
 type Snapshot = { date: string; items: Company[] };
-
 let SNAPSHOT: Snapshot = { date: "", items: [] };
 let UNIVERSE: { ticker: string; cik?: string; exchange: Exchange; name?: string }[] = [];
 
-// ---------------- Helpers ----------------
-
+// ---------- Helpers ----------
 function todayET(): string {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: TIMEZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
+  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit" });
   const p = fmt.formatToParts(new Date());
   const y = p.find((x) => x.type === "year")!.value;
   const m = p.find((x) => x.type === "month")!.value;
   const d = p.find((x) => x.type === "day")!.value;
   return `${y}-${m}-${d}`;
 }
-
-function padCIK(raw: string) {
-  return raw.padStart(10, "0");
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
+function padCIK(raw: string) { return raw.padStart(10, "0"); }
+function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 async function secJSON(url: string) {
-  const res = await fetch(url, {
-    headers: { "User-Agent": SEC_UA, Accept: "application/json" } as any,
-  });
-  if (!res.ok) throw new Error(`SEC fetch ${res.status} ${url}`);
+  const res = await fetch(url, { headers: { "User-Agent": SEC_UA, Accept: "application/json" } as any });
+  if (!res.ok) throw new Error(`SEC ${res.status} ${url}`);
   return res.json();
 }
-
-function classifyExchange(ticker: string): Exchange {
-  const t = ticker.toUpperCase();
-  if (t.length === 5 || t.includes(".") || t.endsWith("F")) return "OTC";
+function classifyExchange(t: string): Exchange {
+  const u = t.toUpperCase();
+  if (u.length === 5 || u.includes(".") || u.endsWith("F")) return "OTC";
   return "NASDAQ";
 }
 
-// Build a bigger ticker universe from SEC's mapping file
-async function buildUniverse(): Promise<
-  { ticker: string; cik?: string; exchange: Exchange; name?: string }[]
-> {
+// Build a larger ticker universe from SEC mapping; skip funds/ETFs/trusts
+async function buildUniverse(): Promise<{ ticker: string; cik?: string; exchange: Exchange; name?: string }[]> {
   const data = await secJSON("https://www.sec.gov/files/company_tickers.json");
-  const rows = Object.keys(data).map((k) => data[k]) as Array<{
-    cik: number;
-    ticker: string;
-    title: string;
-  }>;
-  return rows.slice(0, UNIVERSE_LIMIT).map((r) => ({
+  const rows = Object.keys(data).map((k) => data[k]) as Array<{ cik: number; ticker: string; title: string }>;
+  const CLEAN = rows.filter((r) => !/(ETF|FUND|TRUST|ETN|ETP|INCOME|DIVIDEND)/i.test(r.title || ""));
+  return CLEAN.slice(0, UNIVERSE_LIMIT).map((r) => ({
     ticker: r.ticker.toUpperCase(),
     cik: padCIK(String(r.cik)),
     exchange: classifyExchange(r.ticker),
@@ -101,155 +79,126 @@ async function buildUniverse(): Promise<
   }));
 }
 
-// Pull XBRL company facts (Revenue, CFO, Debt, AP)
+// Most-recent USD value for a tag
+function pickUSDLatest(usgaap: any, tag: string): number | undefined {
+  const arr = (usgaap?.[tag]?.units?.USD as any[]) || [];
+  if (!arr.length) return undefined;
+  const sorted = [...arr].sort((a, b) => String(b.end || "").localeCompare(String(a.end || "")));
+  const v = Number(sorted[0]?.val);
+  return Number.isFinite(v) ? v : undefined;
+}
+
+// Pull XBRL company facts and compute ABL base
 async function pullFacts(cik: string): Promise<Partial<Company>> {
   try {
-    const facts = await secJSON(
-      `https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`
-    );
+    const facts = await secJSON(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`);
     const usgaap = facts.facts?.["us-gaap"] || {};
-    const pickUSD = (tag: string) => {
-      const arr = (usgaap[tag]?.units?.USD as any[]) || [];
-      if (!arr.length) return undefined;
-      const sorted = [...arr].sort((a, b) =>
-        String(b.end || "").localeCompare(String(a.end || ""))
-      );
-      const val = Number(sorted[0]?.val);
-      return Number.isFinite(val) ? val : undefined;
-    };
 
     const revenue =
-      pickUSD("Revenues") ||
-      pickUSD("SalesRevenueNet") ||
-      pickUSD("RevenueFromContractWithCustomerExcludingAssessedTax");
-    const cfo = pickUSD("NetCashProvidedByUsedInOperatingActivities");
-    const ltd = pickUSD("LongTermDebtNoncurrent") ?? pickUSD("LongTermDebt") ?? 0;
-    const std = pickUSD("ShortTermBorrowings") ?? pickUSD("DebtCurrent") ?? 0;
-    const ap = pickUSD("AccountsPayableCurrent");
+      pickUSDLatest(usgaap, "Revenues") ??
+      pickUSDLatest(usgaap, "SalesRevenueNet") ??
+      pickUSDLatest(usgaap, "RevenueFromContractWithCustomerExcludingAssessedTax");
+
+    const cfo = pickUSDLatest(usgaap, "NetCashProvidedByUsedInOperatingActivities");
+
+    const ltd = pickUSDLatest(usgaap, "LongTermDebtNoncurrent") ?? pickUSDLatest(usgaap, "LongTermDebt") ?? 0;
+    const std = pickUSDLatest(usgaap, "ShortTermBorrowings") ?? pickUSDLatest(usgaap, "DebtCurrent") ?? 0;
+    const ap  = pickUSDLatest(usgaap, "AccountsPayableCurrent");
+
+    // Asset components
+    const ar  = pickUSDLatest(usgaap, "AccountsReceivableNetCurrent") ?? pickUSDLatest(usgaap, "AccountsReceivableNet");
+    const inv = pickUSDLatest(usgaap, "InventoryNet") ?? pickUSDLatest(usgaap, "Inventory");
+    const ppe = pickUSDLatest(usgaap, "PropertyPlantAndEquipmentNet");
 
     return {
       revenueLTMUSD: revenue,
       cfoLTMUSD: cfo,
       totalDebtUSD: (ltd || 0) + (std || 0),
       accountsPayableUSD: ap,
+      arUSD: ar,
+      inventoryUSD: inv,
+      ppeUSD: ppe,
     };
   } catch {
     return {};
   }
 }
 
-// SEC submissions → location + last fundraising date
-async function fetchSubmissions(cik: string): Promise<any | undefined> {
-  try {
-    return await secJSON(`https://data.sec.gov/submissions/CIK${cik}.json`);
-  } catch {
-    return undefined;
-  }
+// Submissions → location + last fundraising date
+async function fetchSubs(cik: string): Promise<any | undefined> {
+  try { return await secJSON(`https://data.sec.gov/submissions/CIK${cik}.json`); } catch { return undefined; }
 }
-
-function estimateLocationFromSubs(subs: any): string | undefined {
-  if (!subs) return undefined;
-  const loc =
+function getLocation(subs: any): string | undefined {
+  return (
     subs?.stateOfIncorporation ||
     subs?.addresses?.business?.stateOrCountry ||
     subs?.addresses?.mailing?.stateOrCountry ||
-    subs?.stateOfIncorporationDescription;
-  return typeof loc === "string" ? loc : undefined;
+    subs?.stateOfIncorporationDescription ||
+    undefined
+  );
 }
-
-function estimateLastFundraisingDateFromSubs(subs: any): string | undefined {
-  if (!subs) return undefined;
-  const forms: string[] = subs.filings?.recent?.form || [];
-  const dates: string[] = subs.filings?.recent?.filingDate || [];
+function lastRaise(subs: any): string | undefined {
+  const forms: string[] = subs?.filings?.recent?.form || [];
+  const dates: string[] = subs?.filings?.recent?.filingDate || [];
   let best: string | undefined;
   for (let i = 0; i < forms.length; i++) {
     const f = String(forms[i]).toUpperCase();
-    if (/^(424B\d|8-K|S-1|S-3|D)$/.test(f)) {
-      const dt = dates[i];
-      if (!best || dt > best) best = dt;
-    }
+    if (/^(424B\d|8-K|S-1|S-3|D)$/.test(f)) { const dt = dates[i]; if (!best || dt > best) best = dt; }
   }
   return best;
 }
 
-// OTC ADV stub (plug provider later)
-async function pullOTCVolumeUSD(_ticker: string): Promise<number | undefined> {
-  return undefined;
-}
+// OTC ADV stub (wire OTCMarkets later)
+async function pullOTCVolumeUSD(_t: string): Promise<number | undefined> { return undefined; }
 
-// ---------------- Snapshot refresh ----------------
+// ---------- Snapshot ----------
+function computeBorrowingBase(ar?: number, inv?: number, ppe?: number) {
+  const arPart  = (ar  || 0) * 0.80;
+  const invPart = (inv || 0) * 0.50;
+  const ppePart = (ppe || 0) * 0.25;
+  return arPart + invPart + ppePart;
+}
 
 async function refreshSnapshot(): Promise<Snapshot> {
   const date = todayET();
-
   if (UNIVERSE.length === 0) {
-    try {
-      UNIVERSE = await buildUniverse();
-      console.log(`[universe] loaded ${UNIVERSE.length} tickers`);
-    } catch (e) {
-      console.error("universe load failed", e);
-      UNIVERSE = [
-        { ticker: "VCTR", exchange: "NASDAQ" },
-        { ticker: "HBRF", exchange: "NYSE" },
-        { ticker: "EDEN", exchange: "OTC" },
-        { ticker: "QMIN", exchange: "OTC" },
-      ];
-    }
+    try { UNIVERSE = await buildUniverse(); console.log(`[universe] ${UNIVERSE.length}`); }
+    catch (e) { console.error("universe failed", e); UNIVERSE = [{ ticker: "VCTR", exchange: "NASDAQ" }]; }
   }
 
   const out: Company[] = [];
-
   for (const u of UNIVERSE) {
-    const cik = u.cik;
-    const name = u.name || u.ticker;
-
-    let facts: Partial<Company> = {};
-    let subs: any | undefined;
-
+    const cik = u.cik; const name = u.name || u.ticker;
+    let f: Partial<Company> = {}; let subs: any | undefined;
     if (cik) {
-      await sleep(120); // be polite to SEC
-      facts = await pullFacts(cik);
-      await sleep(80);
-      subs = await fetchSubmissions(cik);
+      await sleep(120); f = await pullFacts(cik);
+      await sleep(80);  subs = await fetchSubs(cik);
     }
-
-    const advUSD =
-      u.exchange === "OTC" ? await pullOTCVolumeUSD(u.ticker) : undefined;
-
+    const bb = computeBorrowingBase(f.arUSD, f.inventoryUSD, f.ppeUSD);
     out.push({
-      ticker: u.ticker,
-      cik,
-      name,
-      exchange: u.exchange,
-      location: estimateLocationFromSubs(subs),
-      lastFundraisingDate: estimateLastFundraisingDateFromSubs(subs),
-      advUSD,
-      ...facts,
+      ticker: u.ticker, cik, name, exchange: u.exchange,
+      location: getLocation(subs),
+      lastFundraisingDate: lastRaise(subs),
+      borrowingBaseUSD: bb,
+      ...f,
+      advUSD: u.exchange === "OTC" ? await pullOTCVolumeUSD(u.ticker) : undefined,
     });
   }
-
   SNAPSHOT = { date, items: out };
   console.log(`[snapshot ${date}] companies=${out.length}`);
   return SNAPSHOT;
 }
 
-// initial + scheduled daily refresh
 refreshSnapshot().catch(console.error);
-cron.schedule(
-  "30 6 * * *",
-  () => {
-    refreshSnapshot().catch(console.error);
-  },
-  { timezone: TIMEZONE }
-);
+cron.schedule("30 6 * * *", () => { refreshSnapshot().catch(console.error); }, { timezone: TIMEZONE });
 
-// ---------------- API ----------------
-
+// ---------- API ----------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const Q = z.object({
+  // basic
   revenue_min: z.coerce.number().optional(),
   revenue_max: z.coerce.number().optional(),
   cfo_min: z.coerce.number().optional(),
@@ -258,67 +207,75 @@ const Q = z.object({
   adv_min: z.coerce.number().optional(),
   location: z.string().optional(),
   exchanges: z.string().optional(),
+
+  // loan-fit
+  loan_size: z.coerce.number().optional(),          // default 3_000_000
+  max_payback_years: z.coerce.number().optional(),  // default 4
+  min_borrow_base: z.coerce.number().optional(),    // default = loan_size
 });
 
-// Simple home page (no template literals to avoid paste issues)
 app.get("/", (_req, res) => {
-  const html =
-    '<h2>EDGAR+OTC Deal Screener API</h2>' +
-    "<p>Daily snapshot (6:30am ET). Try:</p>" +
-    '<ul>' +
-    '<li><a href="/api/health">/api/health</a></li>' +
-    '<li><a href="/api/search?exchanges=NYSE,NASDAQ,OTC">/api/search?exchanges=NYSE,NASDAQ,OTC</a></li>' +
-    '<li><a href="/api/search?exchanges=NASDAQ,OTC&revenue_min=10000000">/api/search with filters</a></li>' +
-    "</ul>";
-  res.type("text/html").send(html);
+  res.type("text/html").send(
+    '<h3>EDGAR Loan-Fit Screener</h3><p>Try <a href="/api/search?exchanges=NASDAQ,OTC,NYSE&loan_size=3000000&max_payback_years=4">/api/search</a></p>'
+  );
 });
-
 app.get("/api/health", (_req, res) => res.json({ ok: true, date: SNAPSHOT.date }));
-
-app.post("/api/refresh", async (_req, res) => {
-  const snap = await refreshSnapshot();
-  res.json({ ok: true, date: snap.date, count: snap.items.length });
-});
+app.post("/api/refresh", async (_req, res) => { const s = await refreshSnapshot(); res.json({ ok: true, date: s.date, count: s.items.length }); });
 
 function ensureFresh() {
   return async (_req: any, _res: any, next: any) => {
-    try {
-      if (SNAPSHOT.date !== todayET()) {
-        await refreshSnapshot();
-      }
-    } catch (e) {
-      console.error("ensureFresh error", e);
-    } finally {
-      next();
-    }
+    try { if (SNAPSHOT.date !== todayET()) await refreshSnapshot(); } catch (e) { console.error(e); } finally { next(); }
   };
 }
 
 app.get("/api/search", ensureFresh(), (req, res) => {
-  const q = Q.safeParse(req.query);
-  if (!q.success) {
-    return res.status(400).json({ error: "bad query", details: q.error.flatten() });
-  }
-  const p = q.data;
-  const exAllowed = p.exchanges
-    ? (p.exchanges.split(",").map((s) => s.trim().toUpperCase()) as Exchange[])
-    : undefined;
+  const r = Q.safeParse(req.query);
+  if (!r.success) return res.status(400).json({ error: "bad query", details: r.error.flatten() });
+  const p = r.data;
 
-  const filtered = SNAPSHOT.items.filter((c) => {
+  const loan = p.loan_size ?? 3_000_000;
+  const maxYears = p.max_payback_years ?? 4;
+  const minBB = p.min_borrow_base ?? loan;
+
+  const exAllowed = p.exchanges ? (p.exchanges.split(",").map(s => s.trim().toUpperCase()) as Exchange[]) : undefined;
+
+  const filtered = SNAPSHOT.items.filter(c => {
     if (exAllowed && !exAllowed.includes(c.exchange)) return false;
     if (p.location && (c.location || "").toLowerCase() !== p.location.toLowerCase()) return false;
+
+    // Basic metrics (optional)
     if (p.revenue_min != null && (c.revenueLTMUSD ?? -Infinity) < p.revenue_min) return false;
     if (p.revenue_max != null && (c.revenueLTMUSD ?? Infinity) > p.revenue_max) return false;
-    if (p.cfo_min != null && (c.cfoLTMUSD ?? -Infinity) < p.cfo_min) return false;
-    if (p.debt_max != null && (c.totalDebtUSD ?? Infinity) > p.debt_max) return false;
-    if (p.ap_max != null && (c.accountsPayableUSD ?? Infinity) > p.ap_max) return false;
-    if (p.adv_min != null && (c.advUSD ?? 0) < p.adv_min) return false;
+    if (p.cfo_min     != null && (c.cfoLTMUSD     ?? -Infinity) < p.cfo_min)     return false;
+    if (p.debt_max    != null && (c.totalDebtUSD  ?? Infinity)  > p.debt_max)    return false;
+    if (p.ap_max      != null && (c.accountsPayableUSD ?? Infinity) > p.ap_max)  return false;
+    if (p.adv_min     != null && (c.advUSD ?? 0) < p.adv_min)                    return false;
+
+    // Loan-fit rules
+    const cfo = c.cfoLTMUSD ?? 0;
+    if (cfo <= 0) return false; // need positive cash flow to service debt
+
+    const bb = c.borrowingBaseUSD ?? 0;
+    if (bb < minBB) return false;
+
+    const paybackYears = loan > 0 && cfo > 0 ? loan / cfo : Infinity;
+    c.paybackYearsAtLoan = paybackYears;
+    c.loanCoverage = bb > 0 ? bb / loan : 0;
+
+    if (paybackYears > maxYears) return false;
+
     return true;
+  });
+
+  // Sort by strongest fit: lower payback first, then larger coverage
+  filtered.sort((a, b) => {
+    const pa = a.paybackYearsAtLoan ?? Infinity, pb = b.paybackYearsAtLoan ?? Infinity;
+    if (pa !== pb) return pa - pb;
+    const ca = a.loanCoverage ?? 0, cb = b.loanCoverage ?? 0;
+    return cb - ca;
   });
 
   res.json({ date: SNAPSHOT.date, count: filtered.length, items: filtered });
 });
 
-app.listen(PORT, () =>
-  console.log(`EDGAR+OTC backend on :${PORT}, daily 6:30am ET refresh`)
-);
+app.listen(PORT, () => console.log(`Loan-fit EDGAR backend :${PORT} (daily 6:30am ET)`));
